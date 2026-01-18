@@ -1,0 +1,15 @@
+ARG BASE
+
+FROM ${BASE}
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION
+
+LABEL maintainer="mengkzhaoyun@gmail.com" \
+      org.opencontainers.image.source="https://github.com/open-beagle/gateway-forward-auth" \
+      org.opencontainers.image.version="${VERSION}"
+
+COPY ./bin/gateway-forward-auth-${TARGETARCH} /usr/local/bin/gateway-forward-auth
+
+ENTRYPOINT ["/usr/local/bin/gateway-forward-auth"]
