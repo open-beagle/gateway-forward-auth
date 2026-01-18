@@ -1,4 +1,4 @@
-ARG BASE
+ARG BASE=alpine:3
 
 FROM ${BASE}
 
@@ -9,6 +9,9 @@ ARG VERSION
 LABEL maintainer="mengkzhaoyun@gmail.com" \
       org.opencontainers.image.source="https://github.com/open-beagle/gateway-forward-auth" \
       org.opencontainers.image.version="${VERSION}"
+
+COPY .beagle/beagle.root.crt /usr/local/share/ca-certificates/beagle.root.crt
+RUN cat /usr/local/share/ca-certificates/beagle.root.crt >> /etc/ssl/certs/ca-certificates.crt
 
 COPY ./bin/gateway-forward-auth-${TARGETARCH} /usr/local/bin/gateway-forward-auth
 
