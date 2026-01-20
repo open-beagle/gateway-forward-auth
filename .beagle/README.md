@@ -4,7 +4,7 @@
 
 ## 跨域 SSO 认证流程
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                              跨域 SSO 认证流程图                                      │
 └─────────────────────────────────────────────────────────────────────────────────────┘
@@ -23,7 +23,7 @@
     │                                  │<─────────────────────────────┤                               │
     │                                  │                              │                               │
     │  4. 307 Redirect                 │                              │                               │
-    │     Set-Cookie: _session=xxx     │                              │                               │
+    │     Set-Cookie: _session=xxx (在 wodcloud.local 域名下)         │                               │
     │     Location: auth.ali.wodcloud.com/_oauth?action=start         │                               │
     │               &session_id=xxx&provider=oidc&redirect=原始URL    │                               │
     │<─────────────────────────────────┤                              │                               │
@@ -31,26 +31,25 @@
     │  5. GET /_oauth?action=start&session_id=xxx&...                 │                               │
     ├────────────────────────────────────────────────────────────────>│                               │
     │                                  │                              │                               │
-    │  6. 307 Redirect                 │                              │                               │
-    │     Set-Cookie: _csrf=nonce      │                              │                               │
-    │     Location: login.ali.wodcloud.com/oidc/auth?...              │                               │
+    │  6. 307 Redirect (直接跳转，无需设置 cookie)                     │                               │
+    │     Location: login.ali.wodcloud.com/oidc/auth                  │                               │
+    │               &state=session_id:redirect_url                    │                               │
     │<────────────────────────────────────────────────────────────────┤                               │
     │                                  │                              │                               │
-    │  7. GET /oidc/auth?client_id=xxx&redirect_uri=auth.ali.wodcloud.com/_oauth&state=...            │
+    │  7. GET /oidc/auth?client_id=xxx&redirect_uri=auth.../_oauth&state=session_id:redirect          │
     ├────────────────────────────────────────────────────────────────────────────────────────────────>│
     │                                  │                              │                               │
     │  8. 用户登录                      │                              │                               │
     │<───────────────────────────────────────────────────────────────────────────────────────────────>│
     │                                  │                              │                               │
     │  9. 302 Redirect                 │                              │                               │
-    │     Location: auth.ali.wodcloud.com/_oauth?code=xxx&state=...   │                               │
+    │     Location: auth.ali.wodcloud.com/_oauth?code=xxx&state=session_id:redirect                   │
     │<────────────────────────────────────────────────────────────────────────────────────────────────┤
     │                                  │                              │                               │
-    │  10. GET /_oauth?code=xxx&state=...                             │                               │
-    │      Cookie: _csrf=nonce         │                              │                               │
+    │  10. GET /_oauth?code=xxx&state=session_id:redirect             │                               │
     ├────────────────────────────────────────────────────────────────>│                               │
     │                                  │                              │                               │
-    │                                  │                              │  11. 验证 CSRF                │
+    │                                  │                              │  11. 解析 state 获取 session_id
     │                                  │                              │      Exchange code for token  │
     │                                  │                              ├──────────────────────────────>│
     │                                  │                              │                               │
@@ -89,9 +88,17 @@
 ### Session 机制
 
 - 第一次访问时在**原始域名**下设置 session cookie
-- session_id 通过 URL 参数传递给 AUTH_HOST
-- 登录成功后，AUTH_HOST 将 email 存入内存 session store（以 session_id 为 key）
+- session_id 通过 URL 参数传递给 AUTH_HOST，再通过 OAuth state 参数传递给 OIDC Provider
+- 登录成功后，AUTH_HOST 从 state 解析 session_id，将 email 存入内存 session store
 - 回到原始域名时，浏览器自动带上 session cookie，forward-auth 查询 session store 完成认证
+
+### 为什么不需要 CSRF Cookie？
+
+传统流程需要 CSRF cookie 防止伪造请求，但在跨域场景下：
+
+- session_id 是随机生成的 32 字节，本身就具有防伪造能力
+- session_id 通过 URL 传递，不依赖 cookie 跨域
+- 只有持有 session_id 的请求才能更新对应的 session
 
 ### 为什么需要这样设计？
 

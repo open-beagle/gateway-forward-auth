@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	"github.com/thomseddon/traefik-forward-auth/internal/provider"
@@ -131,14 +132,71 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 		// Logging setup
 		logger := s.logger(r, "AuthCallback", "default", "Handling callback")
 
-		// Check if this is a start request (cross-domain CSRF cookie setup)
+		// Check if this is a start request (cross-domain auth flow)
 		if r.URL.Query().Get("action") == "start" {
 			s.handleAuthStart(logger, w, r)
 			return
 		}
 
-		// Check state
+		// Get state from callback
 		state := r.URL.Query().Get("state")
+		if state == "" {
+			logger.Warn("Missing state parameter")
+			http.Error(w, "Not authorized", 401)
+			return
+		}
+
+		// Try to parse as cross-domain state (session_id:redirect)
+		// Cross-domain state format: session_id:https://...
+		if idx := strings.Index(state, ":http"); idx > 0 {
+			sessionID := state[:idx]
+			redirect := state[idx+1:]
+
+			// Verify session exists
+			if _, ok := sessionStore.Get(sessionID); !ok {
+				logger.WithField("session_id", sessionID).Warn("Invalid or expired session")
+				http.Error(w, "Not authorized", 401)
+				return
+			}
+
+			// Get default provider
+			p, err := config.GetConfiguredProvider(config.DefaultProvider)
+			if err != nil {
+				logger.WithField("error", err).Warn("Invalid provider")
+				http.Error(w, "Not authorized", 401)
+				return
+			}
+
+			// Exchange code for token
+			token, err := p.ExchangeCode(redirectUri(r), r.URL.Query().Get("code"))
+			if err != nil {
+				logger.WithField("error", err).Error("Code exchange failed with provider")
+				http.Error(w, "Service unavailable", 503)
+				return
+			}
+
+			// Get user
+			user, err := p.GetUser(token)
+			if err != nil {
+				logger.WithField("error", err).Error("Error getting user")
+				http.Error(w, "Service unavailable", 503)
+				return
+			}
+
+			// Update session with email
+			sessionStore.Set(sessionID, user.Email, config.Lifetime)
+
+			logger.WithFields(logrus.Fields{
+				"redirect":   redirect,
+				"user":       user.Email,
+				"session_id": sessionID,
+			}).Info("Cross-domain auth: updated session, redirecting back")
+
+			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
+			return
+		}
+
+		// Same-domain flow: validate CSRF cookie
 		if err := ValidateState(state); err != nil {
 			logger.WithFields(logrus.Fields{
 				"error": err,
@@ -156,7 +214,7 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 		}
 
 		// Validate CSRF cookie against state
-		valid, providerName, redirect, sessionID, err := ValidateCSRFCookie(c, state)
+		valid, providerName, redirect, _, err := ValidateCSRFCookie(c, state)
 		if !valid {
 			logger.WithFields(logrus.Fields{
 				"error":       err,
@@ -197,21 +255,6 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			return
 		}
 
-		// Cross-domain: update session with email and redirect back
-		if sessionID != "" {
-			sessionStore.Set(sessionID, user.Email, config.Lifetime)
-
-			logger.WithFields(logrus.Fields{
-				"provider":   providerName,
-				"redirect":   redirect,
-				"user":       user.Email,
-				"session_id": sessionID,
-			}).Info("Cross-domain auth: updated session, redirecting back")
-
-			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
-			return
-		}
-
 		// Same domain: set cookie directly
 		http.SetCookie(w, MakeCookie(r, user.Email))
 		logger.WithFields(logrus.Fields{
@@ -226,14 +269,13 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 }
 
 // handleAuthStart handles the start of cross-domain auth flow
-// Sets CSRF cookie on AUTH_HOST domain and redirects to provider
+// Redirects directly to provider (no CSRF cookie needed, session_id serves as CSRF token)
 func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r *http.Request) {
-	nonce := r.URL.Query().Get("nonce")
 	providerName := r.URL.Query().Get("provider")
 	redirect := r.URL.Query().Get("redirect")
 	sessionID := r.URL.Query().Get("session_id")
 
-	if nonce == "" || providerName == "" || redirect == "" || sessionID == "" {
+	if providerName == "" || redirect == "" || sessionID == "" {
 		logger.Warn("Missing parameters in auth start request")
 		http.Error(w, "Bad request", 400)
 		return
@@ -247,23 +289,18 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 		return
 	}
 
-	// Set CSRF cookie on AUTH_HOST domain
-	csrf := MakeCSRFCookie(r, nonce)
-	http.SetCookie(w, csrf)
+	// Build state: session_id:redirect
+	state := fmt.Sprintf("%s:%s", sessionID, redirect)
 
-	// Build state with the original redirect URL and session_id
-	// Format: nonce:provider:session_id:redirect
-	state := fmt.Sprintf("%s:%s:%s:%s", nonce, providerName, sessionID, redirect)
-
-	// Redirect to provider login
+	// Redirect directly to provider login (no CSRF cookie needed)
 	loginURL := p.GetLoginURL(redirectUri(r), state)
 	http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
 
 	logger.WithFields(logrus.Fields{
-		"csrf_cookie": csrf,
-		"login_url":   loginURL,
-		"redirect":    redirect,
-	}).Debug("Set CSRF cookie on AUTH_HOST and redirected to provider")
+		"login_url":  loginURL,
+		"session_id": sessionID,
+		"redirect":   redirect,
+	}).Debug("Redirected to provider login")
 }
 
 // LogoutHandler logs a user out
@@ -284,14 +321,6 @@ func (s *Server) LogoutHandler() http.HandlerFunc {
 }
 
 func (s *Server) authRedirect(logger *logrus.Entry, w http.ResponseWriter, r *http.Request, p provider.Provider) {
-	// Error indicates no cookie, generate nonce
-	err, nonce := Nonce()
-	if err != nil {
-		logger.WithField("error", err).Error("Error generating nonce")
-		http.Error(w, "Service unavailable", 503)
-		return
-	}
-
 	// Check if we need to redirect to AUTH_HOST first (cross-domain scenario)
 	if config.AuthHost != "" && r.Host != config.AuthHost {
 		// Generate session ID and set session cookie on current domain
@@ -313,11 +342,10 @@ func (s *Server) authRedirect(logger *logrus.Entry, w http.ResponseWriter, r *ht
 		if proto == "" {
 			proto = "https"
 		}
-		startURL := fmt.Sprintf("%s://%s%s?action=start&nonce=%s&provider=%s&redirect=%s&session_id=%s",
+		startURL := fmt.Sprintf("%s://%s%s?action=start&provider=%s&redirect=%s&session_id=%s",
 			proto,
 			config.AuthHost,
 			config.Path,
-			nonce,
 			url.QueryEscape(p.Name()),
 			url.QueryEscape(returnUrl(r)),
 			url.QueryEscape(sessionID),
@@ -330,7 +358,14 @@ func (s *Server) authRedirect(logger *logrus.Entry, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Same domain or no AUTH_HOST: set CSRF cookie directly
+	// Same domain or no AUTH_HOST: use traditional CSRF cookie flow
+	err, nonce := Nonce()
+	if err != nil {
+		logger.WithField("error", err).Error("Error generating nonce")
+		http.Error(w, "Service unavailable", 503)
+		return
+	}
+
 	csrf := MakeCSRFCookie(r, nonce)
 	http.SetCookie(w, csrf)
 
