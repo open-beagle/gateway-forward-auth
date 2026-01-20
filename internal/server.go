@@ -1,6 +1,7 @@
 package tfa
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 
@@ -125,6 +126,12 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 		// Logging setup
 		logger := s.logger(r, "AuthCallback", "default", "Handling callback")
 
+		// Check if this is a start request (cross-domain CSRF cookie setup)
+		if r.URL.Query().Get("action") == "start" {
+			s.handleAuthStart(logger, w, r)
+			return
+		}
+
 		// Check state
 		state := r.URL.Query().Get("state")
 		if err := ValidateState(state); err != nil {
@@ -198,6 +205,45 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 	}
 }
 
+// handleAuthStart handles the start of cross-domain auth flow
+// Sets CSRF cookie on AUTH_HOST domain and redirects to provider
+func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r *http.Request) {
+	nonce := r.URL.Query().Get("nonce")
+	providerName := r.URL.Query().Get("provider")
+	redirect := r.URL.Query().Get("redirect")
+
+	if nonce == "" || providerName == "" || redirect == "" {
+		logger.Warn("Missing parameters in auth start request")
+		http.Error(w, "Bad request", 400)
+		return
+	}
+
+	// Get provider
+	p, err := config.GetConfiguredProvider(providerName)
+	if err != nil {
+		logger.WithField("error", err).Warn("Invalid provider")
+		http.Error(w, "Bad request", 400)
+		return
+	}
+
+	// Set CSRF cookie on AUTH_HOST domain
+	csrf := MakeCSRFCookie(r, nonce)
+	http.SetCookie(w, csrf)
+
+	// Build state with the original redirect URL
+	state := fmt.Sprintf("%s:%s:%s", nonce, providerName, redirect)
+
+	// Redirect to provider login
+	loginURL := p.GetLoginURL(redirectUri(r), state)
+	http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+
+	logger.WithFields(logrus.Fields{
+		"csrf_cookie": csrf,
+		"login_url":   loginURL,
+		"redirect":    redirect,
+	}).Debug("Set CSRF cookie on AUTH_HOST and redirected to provider")
+}
+
 // LogoutHandler logs a user out
 func (s *Server) LogoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +270,27 @@ func (s *Server) authRedirect(logger *logrus.Entry, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Set the CSRF cookie
+	// Check if we need to redirect to AUTH_HOST first (cross-domain scenario)
+	if config.AuthHost != "" && r.Host != config.AuthHost {
+		// Cross-domain: redirect to AUTH_HOST with nonce in URL
+		proto := r.Header.Get("X-Forwarded-Proto")
+		if proto == "" {
+			proto = "https"
+		}
+		startURL := fmt.Sprintf("%s://%s%s?action=start&nonce=%s&provider=%s&redirect=%s",
+			proto,
+			config.AuthHost,
+			config.Path,
+			nonce,
+			url.QueryEscape(p.Name()),
+			url.QueryEscape(returnUrl(r)),
+		)
+		http.Redirect(w, r, startURL, http.StatusTemporaryRedirect)
+		logger.WithField("start_url", startURL).Debug("Cross-domain: redirected to AUTH_HOST to set CSRF cookie")
+		return
+	}
+
+	// Same domain or no AUTH_HOST: set CSRF cookie directly
 	csrf := MakeCSRFCookie(r, nonce)
 	http.SetCookie(w, csrf)
 
