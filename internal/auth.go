@@ -197,6 +197,41 @@ func buildCSRFCookieName(nonce string) string {
 	return config.CSRFCookieName + "_" + nonce[:6]
 }
 
+// Session cookie name
+const SessionCookieName = "_forward_auth_session"
+
+// MakeSessionCookie creates a session cookie for cross-domain auth
+func MakeSessionCookie(r *http.Request, sessionID string) *http.Cookie {
+	return &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		Domain:   cookieDomain(r),
+		HttpOnly: true,
+		Secure:   !config.InsecureCookie,
+		Expires:  cookieExpiry(),
+	}
+}
+
+// GetSessionID gets the session ID from cookie
+func GetSessionID(r *http.Request) string {
+	c, err := r.Cookie(SessionCookieName)
+	if err != nil {
+		return ""
+	}
+	return c.Value
+}
+
+// GenerateSessionID generates a random session ID
+func GenerateSessionID() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
+}
+
 // MakeCSRFCookie makes a csrf cookie (used during login only)
 //
 // Note, CSRF cookies live shorter than auth cookies, a fixed 1h.
@@ -234,25 +269,38 @@ func FindCSRFCookie(r *http.Request, state string) (c *http.Cookie, err error) {
 }
 
 // ValidateCSRFCookie validates the csrf cookie against state
-func ValidateCSRFCookie(c *http.Cookie, state string) (valid bool, provider string, redirect string, err error) {
+// State format: nonce:provider:redirect (same domain) or nonce:provider:session_id:redirect (cross domain)
+func ValidateCSRFCookie(c *http.Cookie, state string) (valid bool, provider string, redirect string, sessionID string, err error) {
 	if len(c.Value) != 32 {
-		return false, "", "", errors.New("Invalid CSRF cookie value")
+		return false, "", "", "", errors.New("Invalid CSRF cookie value")
 	}
 
 	// Check nonce match
 	if c.Value != state[:32] {
-		return false, "", "", errors.New("CSRF cookie does not match state")
+		return false, "", "", "", errors.New("CSRF cookie does not match state")
 	}
 
-	// Extract provider
+	// Extract params after nonce
 	params := state[33:]
-	split := strings.Index(params, ":")
-	if split == -1 {
-		return false, "", "", errors.New("Invalid CSRF state format")
+	parts := strings.SplitN(params, ":", 3)
+
+	if len(parts) < 2 {
+		return false, "", "", "", errors.New("Invalid CSRF state format")
 	}
 
-	// Valid, return provider and redirect
-	return true, params[:split], params[split+1:], nil
+	provider = parts[0]
+
+	if len(parts) == 2 {
+		// Same domain format: provider:redirect
+		redirect = parts[1]
+		sessionID = ""
+	} else {
+		// Cross domain format: provider:session_id:redirect
+		sessionID = parts[1]
+		redirect = parts[2]
+	}
+
+	return true, provider, redirect, sessionID, nil
 }
 
 // MakeState generates a state value
@@ -417,4 +465,57 @@ func (c *CookieDomains) MarshalFlag() (string, error) {
 		domains = append(domains, d.Domain)
 	}
 	return strings.Join(domains, ","), nil
+}
+
+// CrossDomainToken creates a short-lived token for cross-domain cookie setting
+// Format: base64(hmac)|expires|email
+func MakeCrossDomainToken(email string) string {
+	// Token expires in 60 seconds (just enough time for the redirect)
+	expires := time.Now().Add(60 * time.Second)
+	expiresStr := fmt.Sprintf("%d", expires.Unix())
+
+	// Create HMAC signature
+	hash := hmac.New(sha256.New, config.Secret)
+	hash.Write([]byte("crossdomain"))
+	hash.Write([]byte(email))
+	hash.Write([]byte(expiresStr))
+	mac := base64.URLEncoding.EncodeToString(hash.Sum(nil))
+
+	return fmt.Sprintf("%s|%s|%s", mac, expiresStr, email)
+}
+
+// ValidateCrossDomainToken validates a cross-domain token and returns the email
+func ValidateCrossDomainToken(token string) (string, error) {
+	parts := strings.Split(token, "|")
+	if len(parts) != 3 {
+		return "", errors.New("invalid token format")
+	}
+
+	mac, err := base64.URLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", errors.New("unable to decode token mac")
+	}
+
+	// Verify HMAC
+	hash := hmac.New(sha256.New, config.Secret)
+	hash.Write([]byte("crossdomain"))
+	hash.Write([]byte(parts[2])) // email
+	hash.Write([]byte(parts[1])) // expires
+	expected := hash.Sum(nil)
+
+	if !hmac.Equal(mac, expected) {
+		return "", errors.New("invalid token signature")
+	}
+
+	// Check expiry
+	expires, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return "", errors.New("unable to parse token expiry")
+	}
+
+	if time.Unix(expires, 0).Before(time.Now()) {
+		return "", errors.New("token has expired")
+	}
+
+	return parts[2], nil
 }

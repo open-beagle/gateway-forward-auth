@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	tfa "github.com/thomseddon/traefik-forward-auth/internal"
 )
@@ -20,6 +21,9 @@ func main() {
 
 	// Perform config validation
 	config.Validate()
+
+	// Start session cleanup goroutine
+	tfa.StartSessionCleanup(time.Minute * 5)
 
 	// Build server
 	server := tfa.NewServer()
