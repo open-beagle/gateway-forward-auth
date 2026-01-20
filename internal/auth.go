@@ -280,8 +280,31 @@ func Nonce() (error, string) {
 // Cookie domain
 func cookieDomain(r *http.Request) string {
 	// Check if any of the given cookie domains matches
-	_, domain := matchCookieDomains(r.Host)
-	return domain
+	matched, domain := matchCookieDomains(r.Host)
+	if matched {
+		return domain
+	}
+	// No configured domain matched, extract top-level domain from host
+	return extractTopLevelDomain(r.Host)
+}
+
+// extractTopLevelDomain extracts the top-level domain from a host
+// e.g., "gateway.bc-cloud.com" -> "bc-cloud.com"
+// e.g., "app.sub.example.com" -> "example.com"
+func extractTopLevelDomain(host string) string {
+	// Remove port if present
+	p := strings.Split(host, ":")
+	h := p[0]
+
+	// Split by dots
+	parts := strings.Split(h, ".")
+	if len(parts) <= 2 {
+		// Already a top-level domain or single part
+		return h
+	}
+
+	// Return last two parts as top-level domain
+	return strings.Join(parts[len(parts)-2:], ".")
 }
 
 // Cookie domain
