@@ -311,15 +311,15 @@ func extractTopLevelDomain(host string) string {
 
 // Cookie domain
 func csrfCookieDomain(r *http.Request) string {
-	var host string
-	if use, domain := useAuthDomain(r); use {
-		host = domain
-	} else {
-		host = r.Host
+	// If AUTH_HOST is configured, CSRF cookie must be set on AUTH_HOST domain
+	// so it can be read during OAuth callback
+	if config.AuthHost != "" {
+		p := strings.Split(config.AuthHost, ":")
+		return p[0]
 	}
 
-	// Remove port
-	p := strings.Split(host, ":")
+	// Remove port from request host
+	p := strings.Split(r.Host, ":")
 	return p[0]
 }
 
