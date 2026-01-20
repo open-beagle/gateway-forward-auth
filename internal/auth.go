@@ -135,7 +135,9 @@ func returnUrl(r *http.Request) string {
 
 // Get oauth redirect uri
 func redirectUri(r *http.Request) string {
-	if use, _ := useAuthDomain(r); use {
+	// If AUTH_HOST is configured, always use it as the OAuth callback
+	// This ensures all domains redirect to the same registered callback URL
+	if config.AuthHost != "" {
 		p := r.Header.Get("X-Forwarded-Proto")
 		return fmt.Sprintf("%s://%s%s", p, config.AuthHost, config.Path)
 	}
