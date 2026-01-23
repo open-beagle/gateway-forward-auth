@@ -88,6 +88,26 @@ func (s *Server) AuthHandler(providerName, rule string) http.HandlerFunc {
 
 		// First check session cookie (for cross-domain auth)
 		if sessionID := GetSessionID(r); sessionID != "" {
+			// Check if this is a temporary cookie ID that needs to be unified
+			if mainCookieID, isTemp := sessionStore.GetTempMapping(sessionID); isTemp {
+				logger.WithFields(logrus.Fields{
+					"temp_cookie_id": sessionID,
+					"main_cookie_id": mainCookieID,
+				}).Debug("Detected temporary cookie ID, unifying with 307 redirect")
+
+				// Return 307 redirect to unify cookie_id
+				http.SetCookie(w, MakeSessionCookie(r, mainCookieID))
+
+				// Delete the temporary mapping
+				sessionStore.DeleteTempMapping(sessionID)
+
+				// Redirect to the same URL
+				redirectURL := returnUrl(r)
+				http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+				return
+			}
+
+			// Check if session exists with this cookie_id
 			if session, ok := sessionStore.Get(sessionID); ok {
 				// Session exists and has email, user is authenticated
 				logger.WithField("email", session.Email).Debug("Valid session found")
@@ -154,8 +174,18 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 
 			// Verify session exists
 			if _, ok := sessionStore.Get(sessionID); !ok {
-				logger.WithField("session_id", sessionID).Warn("Invalid or expired session")
-				http.Error(w, "Not authorized", 401)
+				logger.WithField("session_id", sessionID).Warn("Session expired or invalid, restarting auth flow")
+
+				// Get default provider and restart auth flow
+				p, err := config.GetConfiguredProvider(config.DefaultProvider)
+				if err != nil {
+					logger.WithField("error", err).Warn("Invalid provider")
+					http.Error(w, "Not authorized", 401)
+					return
+				}
+
+				// Restart authentication flow
+				s.authRedirect(logger, w, r, p)
 				return
 			}
 
@@ -186,11 +216,14 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			// Update session with email
 			sessionStore.Set(sessionID, user.Email, config.Lifetime)
 
+			// Also set session cookie on AUTH_HOST domain (same cookie_id)
+			http.SetCookie(w, MakeSessionCookie(r, sessionID))
+
 			logger.WithFields(logrus.Fields{
 				"redirect":   redirect,
 				"user":       user.Email,
 				"session_id": sessionID,
-			}).Info("Cross-domain auth: updated session, redirecting back")
+			}).Info("Cross-domain auth: updated session and set cookie on AUTH_HOST, redirecting back")
 
 			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
 			return
@@ -279,6 +312,28 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 		logger.Warn("Missing parameters in auth start request")
 		http.Error(w, "Bad request", 400)
 		return
+	}
+
+	// Check if user is already logged in on AUTH_HOST
+	if authCookieID := GetSessionID(r); authCookieID != "" {
+		if session, ok := sessionStore.Get(authCookieID); ok && session.Email != "" {
+			// User is already logged in on AUTH_HOST
+			logger.WithFields(logrus.Fields{
+				"auth_cookie_id": authCookieID,
+				"temp_cookie_id": sessionID,
+				"email":          session.Email,
+			}).Info("User already logged in, creating temp mapping")
+
+			// Update the temp session with email
+			sessionStore.Set(sessionID, session.Email, config.Lifetime)
+
+			// Create temporary mapping: temp_cookie_id -> main_cookie_id
+			sessionStore.SetTempMapping(sessionID, authCookieID)
+
+			// Redirect back to original domain
+			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
+			return
+		}
 	}
 
 	// Get provider

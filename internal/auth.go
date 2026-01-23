@@ -125,7 +125,18 @@ func ValidateDomains(email string, domains CommaSeparatedList) bool {
 
 // Get the redirect base
 func redirectBase(r *http.Request) string {
-	return fmt.Sprintf("%s://%s", r.Header.Get("X-Forwarded-Proto"), r.Host)
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" {
+		proto = "https"
+	}
+
+	// Use X-Forwarded-Host (original request host) instead of r.Host (forward-auth service host)
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+
+	return fmt.Sprintf("%s://%s", proto, host)
 }
 
 // Return url
@@ -197,13 +208,10 @@ func buildCSRFCookieName(nonce string) string {
 	return config.CSRFCookieName + "_" + nonce[:6]
 }
 
-// Session cookie name
-const SessionCookieName = "_forward_auth_session"
-
 // MakeSessionCookie creates a session cookie for cross-domain auth
 func MakeSessionCookie(r *http.Request, sessionID string) *http.Cookie {
 	return &http.Cookie{
-		Name:     SessionCookieName,
+		Name:     config.CookieName,
 		Value:    sessionID,
 		Path:     "/",
 		Domain:   cookieDomain(r),
@@ -215,7 +223,7 @@ func MakeSessionCookie(r *http.Request, sessionID string) *http.Cookie {
 
 // GetSessionID gets the session ID from cookie
 func GetSessionID(r *http.Request) string {
-	c, err := r.Cookie(SessionCookieName)
+	c, err := r.Cookie(config.CookieName)
 	if err != nil {
 		return ""
 	}
