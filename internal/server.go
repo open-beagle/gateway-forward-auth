@@ -204,7 +204,7 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			log.WithFields(logrus.Fields{
 				"host":          r.Host,
 				"user.name":     getClaimString(user.Claims, "name"),
-				"user.username": getClaimString(user.Claims, "preferred_username"),
+				"user.username": getClaimStringMulti(user.Claims, "preferred_username", "username"),
 				"user.phone":    getClaimString(user.Claims, "phone_number"),
 				"user.sub":      getClaimString(user.Claims, "sub"),
 				"source_ip":     r.Header.Get("X-Forwarded-For"),
@@ -296,7 +296,7 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 		log.WithFields(logrus.Fields{
 			"host":          r.Host,
 			"user.name":     getClaimString(user.Claims, "name"),
-			"user.username": getClaimString(user.Claims, "preferred_username"),
+			"user.username": getClaimStringMulti(user.Claims, "preferred_username", "username"),
 			"user.phone":    getClaimString(user.Claims, "phone_number"),
 			"user.sub":      getClaimString(user.Claims, "sub"),
 			"source_ip":     r.Header.Get("X-Forwarded-For"),
@@ -340,7 +340,7 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 			log.WithFields(logrus.Fields{
 				"host":          targetHost,
 				"user.name":     getClaimString(session.Claims, "name"),
-				"user.username": getClaimString(session.Claims, "preferred_username"),
+				"user.username": getClaimStringMulti(session.Claims, "preferred_username", "username"),
 				"user.phone":    getClaimString(session.Claims, "phone_number"),
 				"user.sub":      getClaimString(session.Claims, "sub"),
 				"source_ip":     r.Header.Get("X-Forwarded-For"),
@@ -553,6 +553,19 @@ func getClaimString(claims map[string]interface{}, key string) string {
 	}
 	if val, ok := claims[key].(string); ok {
 		return val
+	}
+	return ""
+}
+
+// getClaimStringMulti tries multiple keys and returns the first non-empty value
+func getClaimStringMulti(claims map[string]interface{}, keys ...string) string {
+	if claims == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if val, ok := claims[key].(string); ok && val != "" {
+			return val
+		}
 	}
 	return ""
 }

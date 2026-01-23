@@ -108,11 +108,13 @@ func (o *OIDC) GetUser(token string) (User, error) {
 	}
 
 	// If email is empty, try to get it from other common claim names
-	// Priority: name > preferred_username > phone_number > sub
+	// Priority: name > preferred_username/username > phone_number > sub
 	if user.Email == "" {
 		if name, ok := claims["name"].(string); ok && name != "" {
 			user.Email = name
 		} else if username, ok := claims["preferred_username"].(string); ok && username != "" {
+			user.Email = username
+		} else if username, ok := claims["username"].(string); ok && username != "" {
 			user.Email = username
 		} else if phone, ok := claims["phone_number"].(string); ok && phone != "" {
 			user.Email = phone
@@ -137,6 +139,9 @@ func getEmailSource(claims map[string]interface{}, email string) string {
 	}
 	if u, ok := claims["preferred_username"].(string); ok && u == email {
 		return "preferred_username"
+	}
+	if u, ok := claims["username"].(string); ok && u == email {
+		return "username"
 	}
 	if p, ok := claims["phone_number"].(string); ok && p == email {
 		return "phone_number"
