@@ -103,9 +103,11 @@
 
 **Cookie Domain 设置**：
 
-- 使用顶级域名，实现子域名间 Cookie 共享
-- 例如：`app.othersite.com` 和 `api.othersite.com` 都设置 Domain 为 `.othersite.com`
-- 从 `X-Forwarded-Host` 头提取顶级域名（取最后两段）
+- **使用精确的请求域名**，不使用顶级域名
+- 例如：`app.othersite.com` 设置 Domain 为 `app.othersite.com`
+- 例如：`auth.example.com` 设置 Domain 为 `auth.example.com`
+- 从 `X-Forwarded-Host` 头获取原始请求域名
+- **优势**：避免多个 Forward Auth 实例的 Cookie 冲突，支持真正的跨域单点登录
 
 **Session 持久化**：
 

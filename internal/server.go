@@ -117,30 +117,6 @@ func (s *Server) AuthHandler(providerName, rule string) http.HandlerFunc {
 			}
 		}
 
-		// Then check auth cookie (legacy/same-domain)
-		c, err := r.Cookie(config.CookieName)
-		if err == nil {
-			email, err := ValidateCookie(r, c)
-			if err == nil {
-				valid := ValidateEmail(email, rule)
-				if valid {
-					logger.Debug("Allowing valid request")
-					w.Header().Set("X-Forwarded-User", email)
-					w.WriteHeader(200)
-					return
-				}
-				logger.WithField("email", email).Warn("Invalid email")
-				http.Error(w, "Not authorized", 401)
-				return
-			}
-			if err.Error() != "Cookie has expired" {
-				logger.WithField("error", err).Warn("Invalid cookie")
-				http.Error(w, "Not authorized", 401)
-				return
-			}
-			logger.Info("Cookie has expired")
-		}
-
 		// Not authenticated, start auth flow
 		s.authRedirect(logger, w, r, p)
 	}
@@ -288,13 +264,26 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			return
 		}
 
-		// Same domain: set cookie directly
-		http.SetCookie(w, MakeCookie(r, user.Email))
+		// Generate session ID and create session
+		sessionID, err := GenerateSessionID()
+		if err != nil {
+			logger.WithField("error", err).Error("Error generating session ID")
+			http.Error(w, "Service unavailable", 503)
+			return
+		}
+
+		// Create session with user email
+		sessionStore.Set(sessionID, user.Email, config.Lifetime)
+
+		// Set session cookie (same format as cross-domain)
+		http.SetCookie(w, MakeSessionCookie(r, sessionID))
+
 		logger.WithFields(logrus.Fields{
-			"provider": providerName,
-			"redirect": redirect,
-			"user":     user.Email,
-		}).Info("Successfully generated auth cookie, redirecting user.")
+			"provider":   providerName,
+			"redirect":   redirect,
+			"user":       user.Email,
+			"session_id": sessionID,
+		}).Info("Successfully generated session cookie, redirecting user.")
 
 		// Redirect
 		http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)

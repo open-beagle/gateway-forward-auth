@@ -342,27 +342,20 @@ func cookieDomain(r *http.Request) string {
 	if matched {
 		return domain
 	}
-	// No configured domain matched, extract top-level domain from host
-	return extractTopLevelDomain(r.Host)
-}
 
-// extractTopLevelDomain extracts the top-level domain from a host
-// e.g., "gateway.bc-cloud.com" -> "bc-cloud.com"
-// e.g., "app.sub.example.com" -> "example.com"
-func extractTopLevelDomain(host string) string {
-	// Remove port if present
-	p := strings.Split(host, ":")
-	h := p[0]
-
-	// Split by dots
-	parts := strings.Split(h, ".")
-	if len(parts) <= 2 {
-		// Already a top-level domain or single part
-		return h
+	// Use exact request domain (not top-level domain)
+	// This avoids cookie conflicts between different Forward Auth instances
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
 	}
 
-	// Return last two parts as top-level domain
-	return strings.Join(parts[len(parts)-2:], ".")
+	// Remove port if present
+	if idx := strings.Index(host, ":"); idx > 0 {
+		host = host[:idx]
+	}
+
+	return host
 }
 
 // Cookie domain
