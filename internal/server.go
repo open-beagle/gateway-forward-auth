@@ -202,16 +202,18 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 
 			// Log user login (cross-domain flow)
 			log.WithFields(logrus.Fields{
-				"host":      r.Host,
-				"user":      user.Email,
-				"source_ip": r.Header.Get("X-Forwarded-For"),
+				"host":          r.Host,
+				"user.name":     getClaimString(user.Claims, "name"),
+				"user.username": getClaimString(user.Claims, "preferred_username"),
+				"user.phone":    getClaimString(user.Claims, "phone_number"),
+				"user.sub":      getClaimString(user.Claims, "sub"),
+				"source_ip":     r.Header.Get("X-Forwarded-For"),
 			}).Info("User logged in")
 
 			logger.WithFields(logrus.Fields{
 				"redirect":   redirect,
-				"user":       user.Email,
 				"session_id": sessionID,
-			}).Info("Cross-domain auth: updated session and set cookie on AUTH_HOST, redirecting back")
+			}).Debug("Cross-domain auth: updated session and set cookie on AUTH_HOST, redirecting back")
 
 			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
 			return
@@ -292,9 +294,12 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 
 		// Log user login (same-domain flow)
 		log.WithFields(logrus.Fields{
-			"host":      r.Host,
-			"user":      user.Email,
-			"source_ip": r.Header.Get("X-Forwarded-For"),
+			"host":          r.Host,
+			"user.name":     getClaimString(user.Claims, "name"),
+			"user.username": getClaimString(user.Claims, "preferred_username"),
+			"user.phone":    getClaimString(user.Claims, "phone_number"),
+			"user.sub":      getClaimString(user.Claims, "sub"),
+			"source_ip":     r.Header.Get("X-Forwarded-For"),
 		}).Info("User logged in")
 
 		logger.WithFields(logrus.Fields{
@@ -333,9 +338,12 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 
 			// Log cross-domain access
 			log.WithFields(logrus.Fields{
-				"host":      targetHost,
-				"user":      session.Email,
-				"source_ip": r.Header.Get("X-Forwarded-For"),
+				"host":          targetHost,
+				"user.name":     getClaimString(session.Claims, "name"),
+				"user.username": getClaimString(session.Claims, "preferred_username"),
+				"user.phone":    getClaimString(session.Claims, "phone_number"),
+				"user.sub":      getClaimString(session.Claims, "sub"),
+				"source_ip":     r.Header.Get("X-Forwarded-For"),
 			}).Info("User accessed from new domain")
 
 			logger.WithFields(logrus.Fields{
@@ -536,4 +544,15 @@ func (s *Server) logger(r *http.Request, handler, rule, msg string) *logrus.Entr
 	}).Debug(msg)
 
 	return logger
+}
+
+// getClaimString extracts a string claim from claims map
+func getClaimString(claims map[string]interface{}, key string) string {
+	if claims == nil {
+		return ""
+	}
+	if val, ok := claims[key].(string); ok {
+		return val
+	}
+	return ""
 }

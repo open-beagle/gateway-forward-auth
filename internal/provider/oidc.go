@@ -96,8 +96,8 @@ func (o *OIDC) GetUser(token string) (User, error) {
 		return user, err
 	}
 
-	// Log all claims to help debug
-	logrus.WithField("claims", claims).Info("ID Token claims from Logto")
+	// Log all claims at DEBUG level (not INFO, to avoid privacy leak)
+	logrus.WithField("claims", claims).Debug("ID Token claims from provider")
 
 	// Store claims in User struct
 	user.Claims = claims
@@ -108,14 +108,14 @@ func (o *OIDC) GetUser(token string) (User, error) {
 	}
 
 	// If email is empty, try to get it from other common claim names
-	// Priority: email > phone_number > preferred_username > sub
+	// Priority: name > preferred_username > phone_number > sub
 	if user.Email == "" {
-		if email, ok := claims["email"].(string); ok && email != "" {
-			user.Email = email
-		} else if phone, ok := claims["phone_number"].(string); ok && phone != "" {
-			user.Email = phone
+		if name, ok := claims["name"].(string); ok && name != "" {
+			user.Email = name
 		} else if username, ok := claims["preferred_username"].(string); ok && username != "" {
 			user.Email = username
+		} else if phone, ok := claims["phone_number"].(string); ok && phone != "" {
+			user.Email = phone
 		} else if sub, ok := claims["sub"].(string); ok && sub != "" {
 			user.Email = sub
 		}
@@ -125,21 +125,24 @@ func (o *OIDC) GetUser(token string) (User, error) {
 		"email":        user.Email,
 		"claims_count": len(claims),
 		"source":       getEmailSource(claims, user.Email),
-	}).Info("Extracted user info from ID Token")
+	}).Debug("Extracted user info from ID Token")
 
 	return user, nil
 }
 
 // getEmailSource returns which claim was used as email
 func getEmailSource(claims map[string]interface{}, email string) string {
-	if e, ok := claims["email"].(string); ok && e == email {
-		return "email"
+	if n, ok := claims["name"].(string); ok && n == email {
+		return "name"
+	}
+	if u, ok := claims["preferred_username"].(string); ok && u == email {
+		return "preferred_username"
 	}
 	if p, ok := claims["phone_number"].(string); ok && p == email {
 		return "phone_number"
 	}
-	if u, ok := claims["preferred_username"].(string); ok && u == email {
-		return "preferred_username"
+	if e, ok := claims["email"].(string); ok && e == email {
+		return "email"
 	}
 	if s, ok := claims["sub"].(string); ok && s == email {
 		return "sub"

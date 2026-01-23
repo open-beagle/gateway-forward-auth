@@ -46,20 +46,23 @@ time="2026-01-24T00:00:01+08:00" level=info msg="Listening on :4181"
 ### 登录成功
 
 ```text
-time="2026-01-24T08:54:37+08:00" level=info msg="User logged in" host=www.app.com user=user@example.com source_ip=192.168.1.100
+time="2026-01-24T08:54:37+08:00" level=info msg="User logged in" host=www.app.com user.name=张三 user.username=zhangsan user.phone=8618600000000 user.sub=abc123 source_ip=192.168.1.100
 ```
 
 **说明**：
 
 - `time` - 几点几分（Logrus 自动添加）
 - `host` - 哪个域名
-- `user` - 哪个用户（email/phone/username）
+- `user.name` - 用户姓名
+- `user.username` - 用户名
+- `user.phone` - 电话号码
+- `user.sub` - 用户唯一标识
 - `source_ip` - 从哪里来的
 
 ### 跨域访问（已登录）
 
 ```text
-time="2026-01-24T08:55:12+08:00" level=info msg="User accessed from new domain" host=www.bpp.com user=user@example.com source_ip=192.168.1.100
+time="2026-01-24T08:55:12+08:00" level=info msg="User accessed from new domain" host=www.bpp.com user.name=张三 user.username=zhangsan user.phone=8618600000000 user.sub=abc123 source_ip=192.168.1.100
 ```
 
 ### 登出
