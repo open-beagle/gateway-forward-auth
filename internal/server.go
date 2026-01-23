@@ -1,10 +1,12 @@
 package tfa
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/thomseddon/traefik-forward-auth/internal/provider"
@@ -45,6 +47,9 @@ func (s *Server) buildRoutes() {
 
 	// Add logout handler
 	s.muxer.Handle(config.Path+"/logout", s.LogoutHandler())
+
+	// Add debug handler (for debugging user info)
+	s.muxer.Handle(config.Path+"/debug", s.DebugHandler())
 
 	// Add a default handler
 	if config.DefaultAction == "allow" {
@@ -189,11 +194,18 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 				return
 			}
 
-			// Update session with email
-			sessionStore.Set(sessionID, user.Email, config.Lifetime)
+			// Update session with email and claims
+			sessionStore.SetWithClaims(sessionID, user.Email, config.Lifetime, user.Claims)
 
 			// Also set session cookie on AUTH_HOST domain (same cookie_id)
 			http.SetCookie(w, MakeSessionCookie(r, sessionID))
+
+			// Log user login (cross-domain flow)
+			log.WithFields(logrus.Fields{
+				"host":      r.Host,
+				"user":      user.Email,
+				"source_ip": r.Header.Get("X-Forwarded-For"),
+			}).Info("User logged in")
 
 			logger.WithFields(logrus.Fields{
 				"redirect":   redirect,
@@ -272,18 +284,24 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			return
 		}
 
-		// Create session with user email
-		sessionStore.Set(sessionID, user.Email, config.Lifetime)
+		// Create session with user email and claims
+		sessionStore.SetWithClaims(sessionID, user.Email, config.Lifetime, user.Claims)
 
 		// Set session cookie (same format as cross-domain)
 		http.SetCookie(w, MakeSessionCookie(r, sessionID))
 
+		// Log user login (same-domain flow)
+		log.WithFields(logrus.Fields{
+			"host":      r.Host,
+			"user":      user.Email,
+			"source_ip": r.Header.Get("X-Forwarded-For"),
+		}).Info("User logged in")
+
 		logger.WithFields(logrus.Fields{
 			"provider":   providerName,
 			"redirect":   redirect,
-			"user":       user.Email,
 			"session_id": sessionID,
-		}).Info("Successfully generated session cookie, redirecting user.")
+		}).Debug("Successfully generated session cookie, redirecting user.")
 
 		// Redirect
 		http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
@@ -307,11 +325,23 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 	if authCookieID := GetSessionID(r); authCookieID != "" {
 		if session, ok := sessionStore.Get(authCookieID); ok && session.Email != "" {
 			// User is already logged in on AUTH_HOST
+			// Extract target host from redirect URL
+			targetHost := redirect
+			if redirectURL, err := url.Parse(redirect); err == nil {
+				targetHost = redirectURL.Host
+			}
+
+			// Log cross-domain access
+			log.WithFields(logrus.Fields{
+				"host":      targetHost,
+				"user":      session.Email,
+				"source_ip": r.Header.Get("X-Forwarded-For"),
+			}).Info("User accessed from new domain")
+
 			logger.WithFields(logrus.Fields{
 				"auth_cookie_id": authCookieID,
 				"temp_cookie_id": sessionID,
-				"email":          session.Email,
-			}).Info("User already logged in, creating temp mapping")
+			}).Debug("User already logged in, creating temp mapping")
 
 			// Update the temp session with email
 			sessionStore.Set(sessionID, session.Email, config.Lifetime)
@@ -350,17 +380,76 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 // LogoutHandler logs a user out
 func (s *Server) LogoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Log user logout
+		log.WithFields(logrus.Fields{
+			"host": r.Host,
+		}).Info("User logged out")
+
 		// Clear cookie
 		http.SetCookie(w, ClearCookie(r))
 
 		logger := s.logger(r, "Logout", "default", "Handling logout")
-		logger.Info("Logged out user")
+		logger.Debug("Logged out user")
 
 		if config.LogoutRedirect != "" {
 			http.Redirect(w, r, config.LogoutRedirect, http.StatusTemporaryRedirect)
 		} else {
 			http.Error(w, "You have been logged out", 401)
 		}
+	}
+}
+
+// DebugHandler returns current user info and all ID token claims
+func (s *Server) DebugHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := s.logger(r, "Debug", "default", "Handling debug request")
+
+		// Get session ID from cookie
+		sessionID := GetSessionID(r)
+		if sessionID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			w.Write([]byte(`{"error": "Not authenticated", "message": "No session cookie found"}`))
+			return
+		}
+
+		// Get session
+		session, ok := sessionStore.Get(sessionID)
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			w.Write([]byte(`{"error": "Session not found", "session_id": "` + sessionID + `"}`))
+			return
+		}
+
+		// Build response with all claims
+		response := map[string]interface{}{
+			"authenticated": true,
+			"session_id":    sessionID,
+			"email":         session.Email,
+			"created_at":    session.CreatedAt.Format(time.RFC3339),
+			"expires_at":    session.ExpiresAt.Format(time.RFC3339),
+			"claims":        session.Claims,
+		}
+
+		// Convert to JSON
+		jsonBytes, err := json.Marshal(response)
+		if err != nil {
+			logger.WithField("error", err).Error("Error marshaling response")
+			http.Error(w, "Internal server error", 500)
+			return
+		}
+
+		// Return response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(jsonBytes)
+
+		logger.WithFields(logrus.Fields{
+			"session_id":   sessionID,
+			"email":        session.Email,
+			"claims_count": len(session.Claims),
+		}).Info("Debug info returned")
 	}
 }
 

@@ -10,6 +10,8 @@ type Session struct {
 	Email     string
 	CreatedAt time.Time
 	ExpiresAt time.Time
+	// Store all ID token claims for debugging and future use
+	Claims map[string]interface{}
 }
 
 // TempMapping represents a temporary cookie ID mapping
@@ -41,6 +43,20 @@ func (s *SessionStore) Set(cookieID, email string, lifetime time.Duration) {
 		Email:     email,
 		CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(lifetime),
+		Claims:    make(map[string]interface{}),
+	}
+}
+
+// SetWithClaims stores a session with full ID token claims
+func (s *SessionStore) SetWithClaims(cookieID, email string, lifetime time.Duration, claims map[string]interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sessions[cookieID] = &Session{
+		Email:     email,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(lifetime),
+		Claims:    claims,
 	}
 }
 

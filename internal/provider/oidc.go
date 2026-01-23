@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/coreos/go-oidc"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 )
 
@@ -89,10 +90,59 @@ func (o *OIDC) GetUser(token string) (User, error) {
 		return user, err
 	}
 
-	// Extract custom claims
+	// Extract all claims for debugging
+	var claims map[string]interface{}
+	if err := idToken.Claims(&claims); err != nil {
+		return user, err
+	}
+
+	// Log all claims to help debug
+	logrus.WithField("claims", claims).Info("ID Token claims from Logto")
+
+	// Store claims in User struct
+	user.Claims = claims
+
+	// Extract custom claims into User struct
 	if err := idToken.Claims(&user); err != nil {
 		return user, err
 	}
 
+	// If email is empty, try to get it from other common claim names
+	// Priority: email > phone_number > preferred_username > sub
+	if user.Email == "" {
+		if email, ok := claims["email"].(string); ok && email != "" {
+			user.Email = email
+		} else if phone, ok := claims["phone_number"].(string); ok && phone != "" {
+			user.Email = phone
+		} else if username, ok := claims["preferred_username"].(string); ok && username != "" {
+			user.Email = username
+		} else if sub, ok := claims["sub"].(string); ok && sub != "" {
+			user.Email = sub
+		}
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"email":        user.Email,
+		"claims_count": len(claims),
+		"source":       getEmailSource(claims, user.Email),
+	}).Info("Extracted user info from ID Token")
+
 	return user, nil
+}
+
+// getEmailSource returns which claim was used as email
+func getEmailSource(claims map[string]interface{}, email string) string {
+	if e, ok := claims["email"].(string); ok && e == email {
+		return "email"
+	}
+	if p, ok := claims["phone_number"].(string); ok && p == email {
+		return "phone_number"
+	}
+	if u, ok := claims["preferred_username"].(string); ok && u == email {
+		return "preferred_username"
+	}
+	if s, ok := claims["sub"].(string); ok && s == email {
+		return "sub"
+	}
+	return "unknown"
 }

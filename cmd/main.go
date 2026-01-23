@@ -22,6 +22,14 @@ func main() {
 	// Perform config validation
 	config.Validate()
 
+	// Log configuration summary
+	log.WithFields(map[string]interface{}{
+		"provider":    config.DefaultProvider,
+		"auth_host":   config.AuthHost,
+		"cookie_name": config.CookieName,
+		"log_level":   config.LogLevel,
+	}).Info("Configuration loaded")
+
 	// Start session cleanup goroutine
 	tfa.StartSessionCleanup(time.Minute * 5)
 
@@ -33,6 +41,6 @@ func main() {
 
 	// Start
 	log.WithField("config", config).Debug("Starting with config")
-	log.Infof("Listening on :%d", config.Port)
+	log.Info("Listening on :4181")
 	log.Info(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
 }

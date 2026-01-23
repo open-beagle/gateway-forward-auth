@@ -104,7 +104,7 @@
 **Cookie Domain 设置**：
 
 - **使用精确的请求域名**，不使用顶级域名
-- 例如：`app.othersite.com` 设置 Domain 为 `app.othersite.com`
+- 例如：`www.app.com` 设置 Domain 为 `www.app.com`
 - 例如：`auth.example.com` 设置 Domain 为 `auth.example.com`
 - 从 `X-Forwarded-Host` 头获取原始请求域名
 - **优势**：避免多个 Forward Auth 实例的 Cookie 冲突，支持真正的跨域单点登录
@@ -131,16 +131,16 @@
 
 **示例**：
 
-- 用户访问：`https://app.othersite.com/#/resource/detail/123?tab=config`
-- 服务器只能获取：`https://app.othersite.com/`
-- 认证后跳转回：`https://app.othersite.com/`（hash 丢失）
+- 用户访问：`https://www.app.com/#/resource/detail/123?tab=config`
+- 服务器只能获取：`https://www.app.com/`
+- 认证后跳转回：`https://www.app.com/`（hash 丢失）
 
 ### 推荐方案：改用 History 模式
 
 **将前端路由从 Hash 模式改为 History 模式**：
 
-- Hash 模式：`https://app.othersite.com/#/resource/detail/123`
-- History 模式：`https://app.othersite.com/resource/detail/123`
+- Hash 模式：`https://www.app.com/#/resource/detail/123`
+- History 模式：`https://www.app.com/resource/detail/123`
 
 **优势**：
 
@@ -159,7 +159,7 @@
 
 **流程**：
 
-1. 用户访问：`https://app.othersite.com/#/resource/detail/123`
+1. 用户访问：`https://www.app.com/#/resource/detail/123`
 2. Traefik Forward Auth 拦截请求（此时前端 JS 还未加载）
 3. 返回 307 重定向到 OAuth 登录页面
 4. 浏览器直接跳转，前端 JS 根本没有机会执行
