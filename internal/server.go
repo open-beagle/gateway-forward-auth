@@ -316,9 +316,16 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 
 		// Try to parse as cross-domain state (session_id:redirect)
 		// Cross-domain state format: session_id:https://...
-		if idx := strings.Index(state, ":http"); idx > 0 {
-			sessionID := state[:idx]
-			redirect := state[idx+1:]
+		// Same-domain state format: nonce:provider:https://...
+		// Distinguish by checking if second part is "http"
+		parts := strings.SplitN(state, ":", 3)
+		if len(parts) >= 2 && strings.HasPrefix(parts[1], "http") {
+			// Cross-domain format: session_id:https://...
+			sessionID := parts[0]
+			redirect := parts[1]
+			if len(parts) == 3 {
+				redirect = parts[1] + ":" + parts[2] // Reconstruct https://...
+			}
 
 			logger.WithFields(logrus.Fields{
 				"state":      state,
