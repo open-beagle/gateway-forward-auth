@@ -174,6 +174,7 @@ const waitingPageHTML = `<!DOCTYPE html>
     <script>
         const redirectUrl = "{{.RedirectURL}}";
         const sseUrl = "{{.SSEURL}}";
+        const forceLoginUrl = "{{.ForceLoginURL}}";
         
         let seconds = 0;
         let eventSource = null;
@@ -229,8 +230,8 @@ const waitingPageHTML = `<!DOCTYPE html>
             if (eventSource) {
                 eventSource.close();
             }
-            // 重定向到登录页面（带 force 参数）
-            window.location.href = redirectUrl + '&force=true';
+            // 直接跳转到强制登录 URL
+            window.location.href = forceLoginUrl;
         }
 
         // 启动 SSE 连接

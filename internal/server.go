@@ -16,10 +16,11 @@ import (
 
 // AuthFlowTracker tracks ongoing authentication flows
 type AuthFlowTracker struct {
-	inProgress bool
-	startTime  time.Time
-	timeout    time.Duration
-	mutex      sync.RWMutex
+	inProgress   bool
+	startTime    time.Time
+	timeout      time.Duration
+	requestCount int32 // 原子计数器，用于排序请求
+	mutex        sync.RWMutex
 }
 
 // NewAuthFlowTracker creates a new auth flow tracker
@@ -29,12 +30,22 @@ func NewAuthFlowTracker() *AuthFlowTracker {
 	}
 }
 
-// Start starts an authentication flow
-func (t *AuthFlowTracker) Start() {
+// Start starts an authentication flow and returns the request number (1-based)
+func (t *AuthFlowTracker) Start() int32 {
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
-	t.inProgress = true
-	t.startTime = time.Now()
+
+	if !t.inProgress {
+		// First request, start the flow
+		t.inProgress = true
+		t.startTime = time.Now()
+		t.requestCount = 1
+		return 1
+	}
+
+	// Subsequent request
+	t.requestCount++
+	return t.requestCount
 }
 
 // IsInProgress checks if an authentication flow is in progress
@@ -59,6 +70,7 @@ func (t *AuthFlowTracker) Clear() {
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.inProgress = false
+	t.requestCount = 0
 }
 
 // IsTimeout checks if the flow has timed out
@@ -560,35 +572,26 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 
 	// Multi-tab logic: check if auth flow is in progress
 	if s.authTracker.IsInProgress() {
-		// Auth flow already in progress
-		s.waitingMutex.Lock()
-		s.waitingCount++
-		count := s.waitingCount
-		s.waitingMutex.Unlock()
+		// Auth flow already in progress, return waiting page
+		requestNum := s.authTracker.Start()
 
-		logger.WithField("waiting_count", count).Info("Auth flow in progress, returning waiting page")
+		logger.WithField("request_number", requestNum).Info("Auth flow in progress, returning waiting page")
 
 		// Return waiting page with SSE
 		s.returnWaitingPage(w, r, redirect)
 		return
 	}
 
-	// No auth flow in progress, start one
+	// No auth flow in progress, this is the first request
 	if s.authTracker.IsTimeout() {
 		// Previous flow timed out, clear it
 		s.authTracker.Clear()
-		s.waitingMutex.Lock()
-		s.waitingCount = 0
-		s.waitingMutex.Unlock()
 	}
 
 	// Start auth flow and redirect first request to Logto
-	s.authTracker.Start()
-	s.waitingMutex.Lock()
-	s.waitingCount = 1
-	s.waitingMutex.Unlock()
+	requestNum := s.authTracker.Start()
 
-	logger.Info("Auth flow started, redirecting first request to Logto")
+	logger.WithField("request_number", requestNum).Info("First request, redirecting to Logto")
 
 	// Build state: session_id:redirect
 	state := fmt.Sprintf("%s:%s", sessionID, redirect)
@@ -607,9 +610,19 @@ func (s *Server) returnWaitingPage(w http.ResponseWriter, r *http.Request, redir
 	}
 	sseURL := fmt.Sprintf("%s://%s%s/wait", proto, r.Host, config.Path)
 
+	// Build force login URL (for "login myself" button)
+	providerName := r.URL.Query().Get("provider")
+	sessionID := r.URL.Query().Get("session_id")
+	forceLoginURL := fmt.Sprintf("%s://%s%s?force=true&action=start&provider=%s&redirect=%s&session_id=%s",
+		proto, r.Host, config.Path,
+		url.QueryEscape(providerName),
+		url.QueryEscape(redirect),
+		url.QueryEscape(sessionID))
+
 	// Replace placeholders in HTML
 	html := strings.ReplaceAll(waitingPageHTML, "{{.RedirectURL}}", redirect)
 	html = strings.ReplaceAll(html, "{{.SSEURL}}", sseURL)
+	html = strings.ReplaceAll(html, "{{.ForceLoginURL}}", forceLoginURL)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(200)
