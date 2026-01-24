@@ -320,20 +320,19 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			sessionID := state[:idx]
 			redirect := state[idx+1:]
 
+			logger.WithFields(logrus.Fields{
+				"state":      state,
+				"session_id": sessionID,
+				"redirect":   redirect,
+			}).Info("Parsing cross-domain state")
+
 			// Verify session exists
 			if _, ok := sessionStore.Get(sessionID); !ok {
-				logger.WithField("session_id", sessionID).Warn("Session expired or invalid, restarting auth flow")
+				logger.WithField("session_id", sessionID).Warn("Session expired or invalid")
 
-				// Get default provider and restart auth flow
-				p, err := config.GetConfiguredProvider(config.DefaultProvider)
-				if err != nil {
-					logger.WithField("error", err).Warn("Invalid provider")
-					http.Error(w, "Not authorized", 401)
-					return
-				}
-
-				// Restart authentication flow
-				s.authRedirect(logger, w, r, p)
+				// Session expired, redirect back to application
+				// The application will detect no auth and restart the flow
+				http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
 				return
 			}
 
@@ -514,38 +513,52 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 
 	// Check if user is already logged in on AUTH_HOST
 	if authCookieID := GetSessionID(r); authCookieID != "" {
-		if session, ok := sessionStore.Get(authCookieID); ok && session.Email != "" {
-			// User is already logged in on AUTH_HOST
-			// Extract target host from redirect URL
-			targetHost := redirect
-			if redirectURL, err := url.Parse(redirect); err == nil {
-				targetHost = redirectURL.Host
+		if session, ok := sessionStore.Get(authCookieID); ok {
+			// Session exists on AUTH_HOST
+			if session.Email != "" {
+				// User is already logged in
+				// Extract target host from redirect URL
+				targetHost := redirect
+				if redirectURL, err := url.Parse(redirect); err == nil {
+					targetHost = redirectURL.Host
+				}
+
+				// Log cross-domain access
+				log.WithFields(logrus.Fields{
+					"host":          targetHost,
+					"user.name":     getClaimString(session.Claims, "name"),
+					"user.username": getClaimStringMulti(session.Claims, "preferred_username", "username"),
+					"user.phone":    getClaimString(session.Claims, "phone_number"),
+					"user.sub":      getClaimString(session.Claims, "sub"),
+					"source_ip":     r.Header.Get("X-Forwarded-For"),
+				}).Info("User accessed from new domain")
+
+				logger.WithFields(logrus.Fields{
+					"auth_cookie_id": authCookieID,
+					"temp_cookie_id": sessionID,
+				}).Debug("User already logged in, creating temp mapping")
+
+				// Update the temp session with email
+				sessionStore.Set(sessionID, session.Email, config.Lifetime)
+
+				// Create temporary mapping: temp_cookie_id -> main_cookie_id
+				sessionStore.SetTempMapping(sessionID, authCookieID)
+
+				// Redirect back to original domain
+				http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
+				return
+			} else {
+				// Session exists but email is empty, meaning auth flow is in progress
+				// This is a subsequent tab, return waiting page
+				logger.WithField("auth_cookie_id", authCookieID).Info("Auth flow in progress (empty session), returning waiting page")
+
+				// Create temporary mapping for later unification
+				sessionStore.SetTempMapping(sessionID, authCookieID)
+
+				// Return waiting page
+				s.returnWaitingPage(w, r, redirect)
+				return
 			}
-
-			// Log cross-domain access
-			log.WithFields(logrus.Fields{
-				"host":          targetHost,
-				"user.name":     getClaimString(session.Claims, "name"),
-				"user.username": getClaimStringMulti(session.Claims, "preferred_username", "username"),
-				"user.phone":    getClaimString(session.Claims, "phone_number"),
-				"user.sub":      getClaimString(session.Claims, "sub"),
-				"source_ip":     r.Header.Get("X-Forwarded-For"),
-			}).Info("User accessed from new domain")
-
-			logger.WithFields(logrus.Fields{
-				"auth_cookie_id": authCookieID,
-				"temp_cookie_id": sessionID,
-			}).Debug("User already logged in, creating temp mapping")
-
-			// Update the temp session with email
-			sessionStore.Set(sessionID, session.Email, config.Lifetime)
-
-			// Create temporary mapping: temp_cookie_id -> main_cookie_id
-			sessionStore.SetTempMapping(sessionID, authCookieID)
-
-			// Redirect back to original domain
-			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
-			return
 		}
 	}
 
