@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -13,14 +14,125 @@ import (
 	muxhttp "github.com/traefik/traefik/v2/pkg/muxer/http"
 )
 
+// AuthFlowTracker tracks ongoing authentication flows
+type AuthFlowTracker struct {
+	inProgress bool
+	startTime  time.Time
+	timeout    time.Duration
+	mutex      sync.RWMutex
+}
+
+// NewAuthFlowTracker creates a new auth flow tracker
+func NewAuthFlowTracker() *AuthFlowTracker {
+	return &AuthFlowTracker{
+		timeout: 30 * time.Minute,
+	}
+}
+
+// Start starts an authentication flow
+func (t *AuthFlowTracker) Start() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.inProgress = true
+	t.startTime = time.Now()
+}
+
+// IsInProgress checks if an authentication flow is in progress
+func (t *AuthFlowTracker) IsInProgress() bool {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+
+	if !t.inProgress {
+		return false
+	}
+
+	// Check if timeout
+	if time.Since(t.startTime) > t.timeout {
+		return false
+	}
+
+	return true
+}
+
+// Clear clears the authentication flow
+func (t *AuthFlowTracker) Clear() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.inProgress = false
+}
+
+// IsTimeout checks if the flow has timed out
+func (t *AuthFlowTracker) IsTimeout() bool {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.inProgress && time.Since(t.startTime) > t.timeout
+}
+
+// SSEConnectionPool manages SSE connections
+type SSEConnectionPool struct {
+	connections map[string]chan string
+	mutex       sync.RWMutex
+}
+
+// NewSSEConnectionPool creates a new SSE connection pool
+func NewSSEConnectionPool() *SSEConnectionPool {
+	return &SSEConnectionPool{
+		connections: make(map[string]chan string),
+	}
+}
+
+// AddConnection adds a new SSE connection
+func (p *SSEConnectionPool) AddConnection(id string, ch chan string) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.connections[id] = ch
+}
+
+// RemoveConnection removes an SSE connection
+func (p *SSEConnectionPool) RemoveConnection(id string) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if ch, ok := p.connections[id]; ok {
+		close(ch)
+		delete(p.connections, id)
+	}
+}
+
+// Broadcast broadcasts an event to all connections
+func (p *SSEConnectionPool) Broadcast(event string) {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+	for _, ch := range p.connections {
+		select {
+		case ch <- event:
+		default:
+			// Channel full or closed, skip
+		}
+	}
+}
+
+// Count returns the number of active connections
+func (p *SSEConnectionPool) Count() int {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+	return len(p.connections)
+}
+
 // Server contains muxer and handler methods
 type Server struct {
-	muxer *muxhttp.Muxer
+	muxer        *muxhttp.Muxer
+	authTracker  *AuthFlowTracker
+	ssePool      *SSEConnectionPool
+	waitingCount int
+	waitingMutex sync.Mutex
 }
 
 // NewServer creates a new server object and builds muxer
 func NewServer() *Server {
-	s := &Server{}
+	s := &Server{
+		authTracker: NewAuthFlowTracker(),
+		ssePool:     NewSSEConnectionPool(),
+	}
 	s.buildRoutes()
 	return s
 }
@@ -50,6 +162,9 @@ func (s *Server) buildRoutes() {
 
 	// Add debug handler (for debugging user info)
 	s.muxer.Handle(config.Path+"/debug", s.DebugHandler())
+
+	// Add SSE wait handler (for multi-tab auth)
+	s.muxer.Handle(config.Path+"/wait", s.SSEWaitHandler())
 
 	// Add a default handler
 	if config.DefaultAction == "allow" {
@@ -139,6 +254,46 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 			return
 		}
 
+		// Check if user is already logged in on AUTH_HOST (before exchange code)
+		// This handles the case where multiple tabs all go to Logto and authorize
+		if authCookieID := GetSessionID(r); authCookieID != "" {
+			if session, ok := sessionStore.Get(authCookieID); ok && session.Email != "" {
+				logger.WithField("auth_cookie_id", authCookieID).Info("User already logged in, skipping code exchange")
+
+				// Get state to extract redirect URL
+				state := r.URL.Query().Get("state")
+				if state == "" {
+					logger.Warn("Missing state parameter")
+					http.Error(w, "Not authorized", 401)
+					return
+				}
+
+				// Try to parse as cross-domain state (session_id:redirect)
+				if idx := strings.Index(state, ":http"); idx > 0 {
+					redirect := state[idx+1:]
+					logger.WithField("redirect", redirect).Debug("Redirecting already logged in user")
+					http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
+					return
+				}
+
+				// Same-domain flow: validate CSRF cookie and get redirect
+				if err := ValidateState(state); err == nil {
+					if c, err := FindCSRFCookie(r, state); err == nil {
+						if valid, _, redirect, _, err := ValidateCSRFCookie(c, state); valid && err == nil {
+							http.SetCookie(w, ClearCSRFCookie(r, c))
+							logger.WithField("redirect", redirect).Debug("Redirecting already logged in user")
+							http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
+							return
+						}
+					}
+				}
+
+				// Fallback: redirect to root
+				http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+				return
+			}
+		}
+
 		// Get state from callback
 		state := r.URL.Query().Get("state")
 		if state == "" {
@@ -199,6 +354,15 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 
 			// Also set session cookie on AUTH_HOST domain (same cookie_id)
 			http.SetCookie(w, MakeSessionCookie(r, sessionID))
+
+			// Clear auth flow and broadcast SSE event
+			s.authTracker.Clear()
+			s.waitingMutex.Lock()
+			s.waitingCount = 0
+			s.waitingMutex.Unlock()
+			s.ssePool.Broadcast("authenticated")
+
+			logger.WithField("sse_connections", s.ssePool.Count()).Info("Auth flow completed, broadcasted SSE event")
 
 			// Log user login (cross-domain flow)
 			log.WithFields(logrus.Fields{
@@ -292,6 +456,15 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 		// Set session cookie (same format as cross-domain)
 		http.SetCookie(w, MakeSessionCookie(r, sessionID))
 
+		// Clear auth flow and broadcast SSE event (for same-domain multi-tab scenario)
+		s.authTracker.Clear()
+		s.waitingMutex.Lock()
+		s.waitingCount = 0
+		s.waitingMutex.Unlock()
+		s.ssePool.Broadcast("authenticated")
+
+		logger.WithField("sse_connections", s.ssePool.Count()).Info("Auth flow completed, broadcasted SSE event")
+
 		// Log user login (same-domain flow)
 		log.WithFields(logrus.Fields{
 			"host":          r.Host,
@@ -314,11 +487,12 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 }
 
 // handleAuthStart handles the start of cross-domain auth flow
-// Redirects directly to provider (no CSRF cookie needed, session_id serves as CSRF token)
+// Supports multi-tab authentication with waiting page
 func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r *http.Request) {
 	providerName := r.URL.Query().Get("provider")
 	redirect := r.URL.Query().Get("redirect")
 	sessionID := r.URL.Query().Get("session_id")
+	force := r.URL.Query().Get("force") // User clicked "login myself" button
 
 	if providerName == "" || redirect == "" || sessionID == "" {
 		logger.Warn("Missing parameters in auth start request")
@@ -371,18 +545,86 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 		return
 	}
 
-	// Build state: session_id:redirect
-	state := fmt.Sprintf("%s:%s", sessionID, redirect)
+	// Check if force login (user clicked "login myself" button)
+	if force == "true" {
+		logger.Info("Force login requested, redirecting to Logto")
 
-	// Redirect directly to provider login (no CSRF cookie needed)
-	loginURL := p.GetLoginURL(redirectUri(r), state)
-	http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+		// Build state: session_id:redirect
+		state := fmt.Sprintf("%s:%s", sessionID, redirect)
 
-	logger.WithFields(logrus.Fields{
-		"login_url":  loginURL,
-		"session_id": sessionID,
-		"redirect":   redirect,
-	}).Debug("Redirected to provider login")
+		// Redirect to provider login
+		loginURL := p.GetLoginURL(redirectUri(r), state)
+		http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+		return
+	}
+
+	// Multi-tab logic: check if auth flow is in progress
+	if s.authTracker.IsInProgress() {
+		// Auth flow already in progress
+		s.waitingMutex.Lock()
+		s.waitingCount++
+		count := s.waitingCount
+		s.waitingMutex.Unlock()
+
+		logger.WithField("waiting_count", count).Info("Auth flow in progress, returning waiting page")
+
+		// Decide: if this is the 3rd+ request, redirect to Logto
+		// Otherwise, return waiting page
+		if count >= 2 {
+			// This is the Nth request, let it go to Logto
+			logger.Info("Multiple tabs waiting, redirecting this one to Logto")
+
+			// Build state: session_id:redirect
+			state := fmt.Sprintf("%s:%s", sessionID, redirect)
+
+			// Redirect to provider login
+			loginURL := p.GetLoginURL(redirectUri(r), state)
+			http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
+			return
+		}
+
+		// Return waiting page with SSE
+		s.returnWaitingPage(w, r, redirect)
+		return
+	}
+
+	// No auth flow in progress, start one
+	if s.authTracker.IsTimeout() {
+		// Previous flow timed out, clear it
+		s.authTracker.Clear()
+		s.waitingMutex.Lock()
+		s.waitingCount = 0
+		s.waitingMutex.Unlock()
+	}
+
+	// Start auth flow
+	s.authTracker.Start()
+	s.waitingMutex.Lock()
+	s.waitingCount = 1
+	s.waitingMutex.Unlock()
+
+	logger.Info("Auth flow started, returning waiting page")
+
+	// Return waiting page
+	s.returnWaitingPage(w, r, redirect)
+}
+
+// returnWaitingPage returns the waiting page HTML
+func (s *Server) returnWaitingPage(w http.ResponseWriter, r *http.Request, redirect string) {
+	// Build SSE URL
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" {
+		proto = "https"
+	}
+	sseURL := fmt.Sprintf("%s://%s%s/wait", proto, r.Host, config.Path)
+
+	// Replace placeholders in HTML
+	html := strings.ReplaceAll(waitingPageHTML, "{{.RedirectURL}}", redirect)
+	html = strings.ReplaceAll(html, "{{.SSEURL}}", sseURL)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(200)
+	w.Write([]byte(html))
 }
 
 // LogoutHandler logs a user out
@@ -403,6 +645,87 @@ func (s *Server) LogoutHandler() http.HandlerFunc {
 			http.Redirect(w, r, config.LogoutRedirect, http.StatusTemporaryRedirect)
 		} else {
 			http.Error(w, "You have been logged out", 401)
+		}
+	}
+}
+
+// SSEWaitHandler handles SSE connections for waiting pages
+func (s *Server) SSEWaitHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := s.logger(r, "SSEWait", "default", "Handling SSE wait connection")
+
+		// Set SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		// Generate connection ID
+		connID, err := GenerateSessionID()
+		if err != nil {
+			logger.WithField("error", err).Error("Error generating connection ID")
+			http.Error(w, "Internal server error", 500)
+			return
+		}
+
+		// Create event channel
+		eventChan := make(chan string, 10)
+
+		// Add to connection pool
+		s.ssePool.AddConnection(connID, eventChan)
+		defer s.ssePool.RemoveConnection(connID)
+
+		logger.WithField("connection_id", connID).Info("SSE connection established")
+
+		// Get flusher
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			logger.Error("Streaming not supported")
+			http.Error(w, "Streaming not supported", 500)
+			return
+		}
+
+		// Send initial comment
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
+		// Heartbeat ticker (every 30 seconds)
+		heartbeat := time.NewTicker(30 * time.Second)
+		defer heartbeat.Stop()
+
+		// Timeout (30 minutes)
+		timeout := time.After(30 * time.Minute)
+
+		// Event loop
+		for {
+			select {
+			case event := <-eventChan:
+				// Send event
+				fmt.Fprintf(w, "event: %s\n", event)
+				fmt.Fprintf(w, "data: {\"event\": \"%s\"}\n\n", event)
+				flusher.Flush()
+
+				if event == "authenticated" {
+					logger.Info("Sent authenticated event, closing connection")
+					return
+				}
+
+			case <-heartbeat.C:
+				// Send heartbeat
+				fmt.Fprintf(w, "event: heartbeat\n")
+				fmt.Fprintf(w, "data: {\"event\": \"heartbeat\"}\n\n")
+				flusher.Flush()
+
+			case <-timeout:
+				// Timeout
+				logger.Info("SSE connection timeout")
+				return
+
+			case <-r.Context().Done():
+				// Client disconnected
+				logger.Info("SSE connection closed by client")
+				return
+			}
 		}
 	}
 }
