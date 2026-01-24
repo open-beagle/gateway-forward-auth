@@ -122,6 +122,8 @@
 3. **最终状态**：所有域名的 cookie_id 都是 1234，指向唯一的 Session
 4. **数据结构简单**：cookie_id 直接作为 session_id，无需复杂映射
 5. **自动统一**：Forward Auth 自动检测并统一 cookie_id，用户无感知
+6. **统一认证流程**：不使用 CSRF cookie，统一使用 session_id 作为 CSRF token
+7. **Cookie 名称统一**：所有域名使用 `COOKIE_NAME` 环境变量配置的统一名称
 
 ## 前端 Hash 路由丢失的解决方案
 
