@@ -568,21 +568,6 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 
 		logger.WithField("waiting_count", count).Info("Auth flow in progress, returning waiting page")
 
-		// Decide: if this is the 3rd+ request, redirect to Logto
-		// Otherwise, return waiting page
-		if count >= 2 {
-			// This is the Nth request, let it go to Logto
-			logger.Info("Multiple tabs waiting, redirecting this one to Logto")
-
-			// Build state: session_id:redirect
-			state := fmt.Sprintf("%s:%s", sessionID, redirect)
-
-			// Redirect to provider login
-			loginURL := p.GetLoginURL(redirectUri(r), state)
-			http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
-			return
-		}
-
 		// Return waiting page with SSE
 		s.returnWaitingPage(w, r, redirect)
 		return
@@ -597,16 +582,20 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 		s.waitingMutex.Unlock()
 	}
 
-	// Start auth flow
+	// Start auth flow and redirect first request to Logto
 	s.authTracker.Start()
 	s.waitingMutex.Lock()
 	s.waitingCount = 1
 	s.waitingMutex.Unlock()
 
-	logger.Info("Auth flow started, returning waiting page")
+	logger.Info("Auth flow started, redirecting first request to Logto")
 
-	// Return waiting page
-	s.returnWaitingPage(w, r, redirect)
+	// Build state: session_id:redirect
+	state := fmt.Sprintf("%s:%s", sessionID, redirect)
+
+	// Redirect to provider login
+	loginURL := p.GetLoginURL(redirectUri(r), state)
+	http.Redirect(w, r, loginURL, http.StatusTemporaryRedirect)
 }
 
 // returnWaitingPage returns the waiting page HTML
