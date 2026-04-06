@@ -14,111 +14,166 @@ import (
 	muxhttp "github.com/traefik/traefik/v2/pkg/muxer/http"
 )
 
+// getClientIP extracts real client IP for grouping flows
+func getClientIP(r *http.Request) string {
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+	if strings.Contains(ip, ",") {
+		ip = strings.Split(ip, ",")[0]
+	}
+	return strings.TrimSpace(ip)
+}
+
 // AuthFlowTracker tracks ongoing authentication flows
 type AuthFlowTracker struct {
 	inProgress   bool
 	startTime    time.Time
 	timeout      time.Duration
-	requestCount int32 // 原子计数器，用于排序请求
+	requestCount int32
 	mutex        sync.RWMutex
 }
 
-// NewAuthFlowTracker creates a new auth flow tracker
-func NewAuthFlowTracker() *AuthFlowTracker {
-	return &AuthFlowTracker{
-		timeout: 30 * time.Minute,
+// AuthFlowManager manages flows per client
+type AuthFlowManager struct {
+	trackers map[string]*AuthFlowTracker
+	mutex    sync.RWMutex
+}
+
+// NewAuthFlowManager creates a new auth flow manager
+func NewAuthFlowManager() *AuthFlowManager {
+	return &AuthFlowManager{
+		trackers: make(map[string]*AuthFlowTracker),
 	}
 }
 
+func (m *AuthFlowManager) getTracker(key string) *AuthFlowTracker {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	t, ok := m.trackers[key]
+	if !ok {
+		t = &AuthFlowTracker{
+			timeout: 3 * time.Minute, // 缩短超时时间到 3 分钟
+		}
+		m.trackers[key] = t
+	}
+	return t
+}
+
 // Start starts an authentication flow and returns the request number (1-based)
-func (t *AuthFlowTracker) Start() int32 {
+func (m *AuthFlowManager) Start(key string) int32 {
+	t := m.getTracker(key)
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 
 	if !t.inProgress {
-		// First request, start the flow
 		t.inProgress = true
 		t.startTime = time.Now()
 		t.requestCount = 1
 		return 1
 	}
 
-	// Subsequent request
 	t.requestCount++
 	return t.requestCount
 }
 
 // IsInProgress checks if an authentication flow is in progress
-func (t *AuthFlowTracker) IsInProgress() bool {
+func (m *AuthFlowManager) IsInProgress(key string) bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	t, ok := m.trackers[key]
+	if !ok {
+		return false
+	}
+
 	t.mutex.RLock()
 	defer t.mutex.RUnlock()
 
 	if !t.inProgress {
 		return false
 	}
-
-	// Check if timeout
 	if time.Since(t.startTime) > t.timeout {
 		return false
 	}
-
 	return true
 }
 
 // Clear clears the authentication flow
-func (t *AuthFlowTracker) Clear() {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-	t.inProgress = false
-	t.requestCount = 0
+func (m *AuthFlowManager) Clear(key string) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	t, ok := m.trackers[key]
+	if ok {
+		t.mutex.Lock()
+		t.inProgress = false
+		t.requestCount = 0
+		t.mutex.Unlock()
+		delete(m.trackers, key)
+	}
 }
 
 // IsTimeout checks if the flow has timed out
-func (t *AuthFlowTracker) IsTimeout() bool {
+func (m *AuthFlowManager) IsTimeout(key string) bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	t, ok := m.trackers[key]
+	if !ok {
+		return false
+	}
+
 	t.mutex.RLock()
 	defer t.mutex.RUnlock()
 	return t.inProgress && time.Since(t.startTime) > t.timeout
 }
 
+// SSEConnection represents a single SSE connection
+type SSEConnection struct {
+	ch      chan string
+	groupID string
+}
+
 // SSEConnectionPool manages SSE connections
 type SSEConnectionPool struct {
-	connections map[string]chan string
+	connections map[string]*SSEConnection
 	mutex       sync.RWMutex
 }
 
 // NewSSEConnectionPool creates a new SSE connection pool
 func NewSSEConnectionPool() *SSEConnectionPool {
 	return &SSEConnectionPool{
-		connections: make(map[string]chan string),
+		connections: make(map[string]*SSEConnection),
 	}
 }
 
 // AddConnection adds a new SSE connection
-func (p *SSEConnectionPool) AddConnection(id string, ch chan string) {
+func (p *SSEConnectionPool) AddConnection(id string, groupID string, ch chan string) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.connections[id] = ch
+	p.connections[id] = &SSEConnection{ch: ch, groupID: groupID}
 }
 
 // RemoveConnection removes an SSE connection
 func (p *SSEConnectionPool) RemoveConnection(id string) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	if ch, ok := p.connections[id]; ok {
-		close(ch)
+	if conn, ok := p.connections[id]; ok {
+		close(conn.ch)
 		delete(p.connections, id)
 	}
 }
 
-// Broadcast broadcasts an event to all connections
-func (p *SSEConnectionPool) Broadcast(event string) {
+// Notify broadcasts an event to connections in a specific group
+func (p *SSEConnectionPool) Notify(groupID string, event string) {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
-	for _, ch := range p.connections {
-		select {
-		case ch <- event:
-		default:
-			// Channel full or closed, skip
+	for _, conn := range p.connections {
+		if conn.groupID == groupID {
+			select {
+			case conn.ch <- event:
+			default:
+				// Channel full or closed, skip
+			}
 		}
 	}
 }
@@ -133,7 +188,7 @@ func (p *SSEConnectionPool) Count() int {
 // Server contains muxer and handler methods
 type Server struct {
 	muxer        *muxhttp.Muxer
-	authTracker  *AuthFlowTracker
+	authTracker  *AuthFlowManager
 	ssePool      *SSEConnectionPool
 	waitingCount int
 	waitingMutex sync.Mutex
@@ -142,7 +197,7 @@ type Server struct {
 // NewServer creates a new server object and builds muxer
 func NewServer() *Server {
 	s := &Server{
-		authTracker: NewAuthFlowTracker(),
+		authTracker: NewAuthFlowManager(),
 		ssePool:     NewSSEConnectionPool(),
 	}
 	s.buildRoutes()
@@ -239,8 +294,8 @@ func (s *Server) AuthHandler(providerName, rule string) http.HandlerFunc {
 				return
 			}
 
-			// Check if session exists with this cookie_id
-			if session, ok := sessionStore.Get(sessionID); ok {
+			// Check if session exists and has a valid email address
+			if session, ok := sessionStore.Get(sessionID); ok && session.Email != "" {
 				// Session exists and has email, user is authenticated
 				logger.WithField("email", session.Email).Debug("Valid session found")
 				w.Header().Set("X-Forwarded-User", session.Email)
@@ -362,12 +417,13 @@ func (s *Server) AuthCallbackHandler() http.HandlerFunc {
 		// Also set session cookie on AUTH_HOST domain (same cookie_id)
 		http.SetCookie(w, MakeSessionCookie(r, sessionID))
 
-		// Clear auth flow and broadcast SSE event
-		s.authTracker.Clear()
+		// Clear auth flow and notify SSE clients for this IP
+		clientIP := getClientIP(r)
+		s.authTracker.Clear(clientIP)
 		s.waitingMutex.Lock()
 		s.waitingCount = 0
 		s.waitingMutex.Unlock()
-		s.ssePool.Broadcast("authenticated")
+		s.ssePool.Notify(clientIP, "authenticated")
 
 		logger.WithField("sse_connections", s.ssePool.Count()).Info("Auth flow completed, broadcasted SSE event")
 
@@ -485,31 +541,30 @@ func (s *Server) handleAuthStart(logger *logrus.Entry, w http.ResponseWriter, r 
 	}
 
 	// No auth cookie or session not found
-	// Check if auth flow is in progress (multi-tab scenario)
-	if s.authTracker.IsInProgress() {
+	// Check if auth flow is in progress for this client IP
+	clientIP := getClientIP(r)
+	if s.authTracker.IsInProgress(clientIP) {
 		// Auth flow already in progress, return waiting page
-		requestNum := s.authTracker.Start()
+		requestNum := s.authTracker.Start(clientIP)
 
 		logger.WithField("request_number", requestNum).Info("Auth flow in progress, returning waiting page")
 
 		// Set session cookie on AUTH_HOST (same session_id as application domain)
 		http.SetCookie(w, MakeSessionCookie(r, sessionID))
 
-		// Create temporary mapping (will be unified after login)
-		// Note: we don't know the main cookie_id yet, so we'll handle this in callback
 		// For now, just return waiting page
 		s.returnWaitingPage(w, r, redirect)
 		return
 	}
 
 	// No auth flow in progress, this is the first request
-	if s.authTracker.IsTimeout() {
+	if s.authTracker.IsTimeout(clientIP) {
 		// Previous flow timed out, clear it
-		s.authTracker.Clear()
+		s.authTracker.Clear(clientIP)
 	}
 
 	// Start auth flow and redirect first request to Logto
-	requestNum := s.authTracker.Start()
+	requestNum := s.authTracker.Start(clientIP)
 
 	logger.WithField("request_number", requestNum).Info("First request, redirecting to Logto")
 
@@ -597,7 +652,8 @@ func (s *Server) SSEWaitHandler() http.HandlerFunc {
 		eventChan := make(chan string, 10)
 
 		// Add to connection pool
-		s.ssePool.AddConnection(connID, eventChan)
+		clientIP := getClientIP(r)
+		s.ssePool.AddConnection(connID, clientIP, eventChan)
 		defer s.ssePool.RemoveConnection(connID)
 
 		logger.WithField("connection_id", connID).Info("SSE connection established")
